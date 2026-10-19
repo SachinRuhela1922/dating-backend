@@ -59,6 +59,9 @@ const chatSchema = new Schema({
   toUserId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
   text: { type: String, required: true, trim: true, maxlength: 1000 },
   readAt: { type: Date, default: null },   // null = unread
+  cid: { type: String },                      // client-generated id: makes retries idempotent
 }, { timestamps: true });
 chatSchema.index({ fromUserId: 1, toUserId: 1, createdAt: -1 });
+chatSchema.index({ toUserId: 1, fromUserId: 1, readAt: 1 });            // unread counts
+chatSchema.index({ fromUserId: 1, cid: 1 }, { unique: true, partialFilterExpression: { cid: { $type: 'string' } } });
 export const ChatMessage = model('ChatMessage', chatSchema);

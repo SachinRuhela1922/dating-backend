@@ -3,7 +3,8 @@ import mongoose from 'mongoose';
 import { Profile, ConnectRequest, ChatMessage } from './models.js';
 import { requireAuth } from './routes.js';
 import { cardProfile } from './profile.js';
-import { notifyNewMessage } from './notify.js';
+import { sendChatMessage } from './chat.js';
+import { emitToUser } from './hub.js';
 
 const httpErr = (status, message) => Object.assign(new Error(message), { status });
 const h = fn => (req, res, next) => fn(req, res, next).catch(next);
@@ -42,8 +43,11 @@ const respond = status => h(async (req, res) => {
   const r = await ConnectRequest.findOneAndUpdate(
     { _id: req.params.id, toUserId: req.user._id, status: 'pending' }, { status }, { new: true });
   if (!r) throw httpErr(404, 'Request nahi mili ya pehle hi respond ho chuki hai.');
-  const p = await Profile.findOne({ userId: r.fromUserId });
-  res.json({ ok: true, profileId: p?.id });
+  const [p, mine] = await Promise.all([Profile.findOne({ userId: r.fromUserId }), Profile.findOne({ userId: req.user._id })]);
+  // Live updates: my other tabs/badges drop the request; the sender sees the new connection instantly.
+  emitToUser(req.user._id, 'request:removed', { id: r.id });
+  if (status === 'accepted' && mine) emitToUser(r.fromUserId, 'request:accepted', { profileId: mine.id, profile: cardProfile(mine) });
+  res.json({ ok: true, profileId: p?.id, profile: p ? cardProfile(p) : undefined });
 });
 connect.post('/requests/:id/accept', respond('accepted'));
 connect.post('/requests/:id/decline', respond('declined'));
@@ -54,25 +58,31 @@ connect.get('/unread', h(async (req, res) => {
 }));
 
 // Accepted connections = the Messages list, with unread count per chat.
+// 1 query for links, 1 for profiles, 1 grouped query for unread, and the last messages in parallel.
 connect.get('/matches', h(async (req, res) => {
   const me = req.user._id;
   const links = await ConnectRequest.find({ status: 'accepted', $or: [{ fromUserId: me }, { toUserId: me }] });
-  const otherIds = links.map(l => (same(l.fromUserId, me) ? l.toUserId : l.fromUserId));
-  const profiles = await Profile.find({ userId: { $in: otherIds } });
+  const otherIds = [...new Set(links.map(l => String(same(l.fromUserId, me) ? l.toUserId : l.fromUserId)))];
+  const [profiles, unreadRows, lasts] = await Promise.all([
+    Profile.find({ userId: { $in: otherIds } }),
+    ChatMessage.aggregate([
+      { $match: { toUserId: me, readAt: null } },
+      { $group: { _id: '$fromUserId', n: { $sum: 1 } } },
+    ]),
+    Promise.all(otherIds.map(id => ChatMessage.findOne(pair(me, id)).sort({ createdAt: -1 }))),
+  ]);
   const byUser = new Map(profiles.map(p => [String(p.userId), p]));
+  const unreadBy = new Map(unreadRows.map(u => [String(u._id), u.n]));
   const matches = [];
-  for (const id of otherIds) {
-    const p = byUser.get(String(id));
-    if (!p) continue;
-    const [last, unread] = await Promise.all([
-      ChatMessage.findOne(pair(me, id)).sort({ createdAt: -1 }),
-      ChatMessage.countDocuments({ fromUserId: id, toUserId: me, readAt: null }),
-    ]);
+  otherIds.forEach((id, i) => {
+    const p = byUser.get(id);
+    if (!p) return;
+    const last = lasts[i];
     matches.push({
-      profile: cardProfile(p), unread,
+      profile: cardProfile(p), unread: unreadBy.get(id) || 0,
       lastMessage: last ? { text: last.text, mine: same(last.fromUserId, me), createdAt: last.createdAt } : null,
     });
-  }
+  });
   matches.sort((a, b) => new Date(b.lastMessage?.createdAt || 0) - new Date(a.lastMessage?.createdAt || 0));
   res.json({ matches });
 }));
@@ -87,7 +97,7 @@ connect.get('/chat/:profileId', h(async (req, res) => {
   ]);
   res.json({
     profile: cardProfile(other),
-    messages: msgs.reverse().map(m => ({ id: m.id, text: m.text, mine: same(m.fromUserId, me), createdAt: m.createdAt })),
+    messages: msgs.reverse().map(m => ({ id: m.id, text: m.text, mine: same(m.fromUserId, me), createdAt: m.createdAt, cid: same(m.fromUserId, me) ? m.cid : undefined })),
   });
 }));
 
@@ -97,14 +107,8 @@ connect.post('/chat/:profileId/read', h(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// REST fallback for sending (the app normally sends over the socket). Same logic, same live events.
 connect.post('/chat/:profileId', h(async (req, res) => {
-  const me = req.user._id;
-  const other = await connectedProfile(me, req.params.profileId);
-  const text = String(req.body?.text || '').trim();
-  if (!text || text.length > 1000) throw httpErr(400, 'Message 1 se 1000 characters ka hona chahiye.');
-  const unreadBefore = await ChatMessage.countDocuments({ fromUserId: me, toUserId: other.userId, readAt: null });
-  const m = await ChatMessage.create({ fromUserId: me, toUserId: other.userId, text });
-  const mine = await Profile.findOne({ userId: me });
-  if (mine) notifyNewMessage(other.userId, mine, m, unreadBefore === 0).catch(e => console.error('Notify failed:', e.message));
-  res.status(201).json({ message: { id: m.id, text: m.text, mine: true, createdAt: m.createdAt } });
+  const message = await sendChatMessage({ me: req.user._id, profileId: req.params.profileId, text: req.body?.text, cid: req.body?.cid });
+  res.status(201).json({ message });
 }));

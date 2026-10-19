@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import mongoose from 'mongoose';
 import { User, Otp } from './models.js';
 import { sendOtpMail } from './mail.js';
+import { signSocketToken } from './socketToken.js';
 
 const COOLDOWN = 60, TTL_MS = 10 * 60 * 1000, MAX_ATTEMPTS = 5;
 const MAX_AGE_MS = Number(process.env.SESSION_MAX_DAYS || 30) * 864e5;
@@ -134,6 +135,12 @@ auth.post('/logout', (req, res) => {
 
 auth.get('/me', requireAuth, (req, res) =>
   res.json({ user: publicUser(req.user), sessionExpiresAt: req.session.cookie.expires }));
+
+// Short-lived token for opening the WebSocket directly on the API host (see socketToken.js).
+auth.get('/socket-token', requireAuth, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ token: signSocketToken(req.user.id) });
+});
 
 export const dashboard = Router();
 dashboard.use(requireAuth);

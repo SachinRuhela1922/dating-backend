@@ -174,8 +174,9 @@ profile.post('/:id/request', h(async (req, res) => {
   const me = req.user._id, them = target.userId;
   if (await ConnectRequest.exists({ $or: [{ fromUserId: me, toUserId: them }, { fromUserId: them, toUserId: me }] }))
     throw httpErr(409, 'Is profile ke saath pehle se request ya connection hai.');
-  try { await ConnectRequest.create({ fromUserId: req.user._id, toUserId: target.userId, note }); }
+  let doc;
+  try { doc = await ConnectRequest.create({ fromUserId: req.user._id, toUserId: target.userId, note }); }
   catch (e) { if (e.code === 11000) throw httpErr(409, 'Request pehle hi bhej di hai.'); throw e; }
-  notifyNewRequest(target.userId, mine).catch(e => console.error('Notify failed:', e.message));
+  notifyNewRequest(target.userId, mine, { id: doc.id, note: doc.note, createdAt: doc.createdAt, profile: cardProfile(mine) }).catch(e => console.error('Notify failed:', e.message));
   res.status(201).json({ ok: true });
 }));

@@ -40,7 +40,7 @@ const sessionMiddleware = session({
   resave: false,
   saveUninitialized: false,
   rolling: true,                                   // idle timeout renews on activity
-  store: MongoStore.create({ client: mongoose.connection.getClient(), stringify: false, ttl: idleMs / 1000 }),
+  store: MongoStore.create({ client: mongoose.connection.getClient(), stringify: false, ttl: idleMs / 1000, touchAfter: 3600 }),
   cookie: { httpOnly: true, sameSite: 'lax', secure: prod, maxAge: idleMs },
 });
 app.use(sessionMiddleware);
@@ -52,6 +52,7 @@ app.use('/api/auth', auth);
 app.use('/api/dashboard', dashboard);
 app.use('/api/profile', profile);
 app.use('/api/connect', connect);
+app.get('/api/health', (req, res) => res.json({ ok: true })); // no DB: for uptime pings / keep-warm
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found.' }));
 
 if (prod) {

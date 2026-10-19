@@ -1,12 +1,11 @@
 import { Server } from 'socket.io';
 import mongoose from 'mongoose';
 import { Profile, ConnectRequest } from './models.js';
+import { setIo, isOnline, emitToUser, markConnected, markDisconnected } from './hub.js';
+import { sendChatMessage } from './chat.js';
+import { verifySocketToken } from './socketToken.js';
 
-let io;
-const online = new Map(); // userId -> number of open sockets (several tabs possible)
-
-export const isOnline = id => (online.get(String(id)) || 0) > 0;
-export const emitToUser = (id, event, payload) => io?.to(`u:${id}`).emit(event, payload);
+export { isOnline, emitToUser }; // kept so older imports keep working
 
 async function friendIds(userId) {
   const links = await ConnectRequest.find({ status: 'accepted', $or: [{ fromUserId: userId }, { toUserId: userId }] });
@@ -29,28 +28,41 @@ async function connectedUserId(me, profileId) {
   return ok ? other.userId : null;
 }
 
+// Browsers must be allowed to open the socket straight on the API host (different origin).
+const allowedOrigins = () =>
+  [process.env.APP_URL, ...(process.env.CORS_ORIGINS || '').split(',')]
+    .map(o => (o || '').trim().replace(/\/$/, '')).filter(Boolean);
+
 export function initRealtime(httpServer, sessionMiddleware) {
-  io = new Server(httpServer);
-  io.engine.use(sessionMiddleware); // same cookie session as the REST API
+  const io = new Server(httpServer, {
+    cors: { origin: (origin, cb) => cb(null, !origin || allowedOrigins().includes(origin)), methods: ['GET', 'POST'] },
+    pingInterval: 10_000,   // dead connections (phone sleep, network switch) are noticed in ~15s, not ~45s
+    pingTimeout: 8_000,
+    maxHttpBufferSize: 16 * 1024,
+  });
+  setIo(io);
+  io.engine.use(sessionMiddleware); // same-origin setups (dev proxy / single-origin prod) can still use the cookie
 
   io.use((socket, next) => {
-    const uid = socket.request.session?.userId;
+    const uid = verifySocketToken(socket.handshake.auth?.token) || socket.request.session?.userId;
     if (!uid) return next(new Error('unauthorized'));
-    socket.userId = String(uid);
+    socket.data.userId = String(uid);
     next();
   });
 
   io.on('connection', async socket => {
-    const uid = socket.userId;
+    const uid = socket.data.userId;
     socket.join(`u:${uid}`);
-    const first = !isOnline(uid);
-    online.set(uid, (online.get(uid) || 0) + 1);
+    const first = markConnected(uid);
 
     try {
       const mine = await Profile.findOne({ userId: uid });
-      socket.profileId = mine?.id;
-      if (first && socket.profileId) await broadcastPresence(uid, socket.profileId, true);
+      socket.data.profileId = mine?.id;
+      if (first && mine) await broadcastPresence(uid, mine.id, true);
     } catch (e) { console.error('Presence error:', e.message); }
+
+    // Client uses this to check a connection is really alive after the app was in the background.
+    socket.on('ping:check', ack => { if (typeof ack === 'function') ack(); });
 
     socket.on('presence:get', async (profileId, ack) => {
       if (typeof ack !== 'function') return;
@@ -59,18 +71,32 @@ export function initRealtime(httpServer, sessionMiddleware) {
     });
 
     socket.on('typing', async profileId => {
-      if (!socket.profileId) return;
+      if (!socket.data.profileId) return;
       try {
         const other = await connectedUserId(uid, profileId);
-        if (other) emitToUser(other, 'typing', { profileId: socket.profileId });
+        if (other) emitToUser(other, 'typing', { profileId: socket.data.profileId });
       } catch { /* ignore */ }
     });
 
+    // Send a chat message over the socket: no HTTP round trip, no session/user lookup per message.
+    const sentAt = [];
+    socket.on('chat:send', async (payload, ack) => {
+      if (typeof ack !== 'function') return;
+      const now = Date.now();
+      while (sentAt.length && now - sentAt[0] > 10_000) sentAt.shift();
+      if (sentAt.length >= 20) return ack({ ok: false, error: 'Thoda dheere, bahut zyada messages.' });
+      sentAt.push(now);
+      try {
+        const { profileId, text, cid } = payload || {};
+        ack({ ok: true, message: await sendChatMessage({ me: uid, profileId, text, cid }) });
+      } catch (e) {
+        if (!e.status) console.error('chat:send failed:', e.message);
+        ack({ ok: false, error: e.status ? e.message : 'Message nahi ja paya.' });
+      }
+    });
+
     socket.on('disconnect', () => {
-      const left = (online.get(uid) || 1) - 1;
-      if (left > 0) return online.set(uid, left);
-      online.delete(uid);
-      if (socket.profileId) broadcastPresence(uid, socket.profileId, false).catch(() => {});
+      if (markDisconnected(uid) && socket.data.profileId) broadcastPresence(uid, socket.data.profileId, false).catch(() => {});
     });
   });
 }
